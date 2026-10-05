@@ -152,8 +152,10 @@ function extractRegexSources(text: string): string[] {
   }
 
   // The task is email validation, so any correct pattern must contain "@".
-  // This keeps unrelated string constants out of the fixture run.
-  return [...sources].filter((s) => s.includes("@"));
+  // A minimum length also drops incidental fragments like the bare string
+  // "@" or "a@b" that cannot be a real validator but would otherwise clutter
+  // the evidence panel.
+  return [...sources].filter((s) => s.includes("@") && s.length >= 6);
 }
 
 function scoreCodeGeneration(text: string): ScoreResult {
