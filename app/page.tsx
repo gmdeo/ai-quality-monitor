@@ -1,169 +1,315 @@
 "use client";
 
-import { useState } from "react";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+} from "recharts";
 import { format } from "date-fns";
+import type { TestRun } from "./lib/quality";
+import { loadRuns, saveRun, clearRuns } from "./lib/run-store";
 
-// Test categories with specific prompts
-const TEST_CATEGORIES = {
-  CODE_GENERATION: {
-    name: "Code Generation",
-    prompt: "Write a Python function that validates an email address using regex. Include error handling and type hints.",
-    scoreThreshold: 70,
-  },
-  REASONING: {
-    name: "Logical Reasoning",
-    prompt: "If all roses are flowers and some flowers fade quickly, can we conclude that some roses fade quickly? Explain your reasoning step by step.",
-    scoreThreshold: 75,
-  },
-  FACTUAL_ACCURACY: {
-    name: "Factual Accuracy",
-    prompt: "What is the capital of Australia? Provide your answer and explain why this is often confused.",
-    scoreThreshold: 90,
-  },
-  INSTRUCTION_FOLLOWING: {
-    name: "Instruction Following",
-    prompt: "List exactly 3 benefits of exercise. Format as: 1. [benefit] 2. [benefit] 3. [benefit]. Do not add introduction or conclusion.",
-    scoreThreshold: 85,
-  },
-};
-
-type TestResult = {
+interface CategoryInfo {
   id: string;
-  timestamp: Date;
-  category: string;
-  modelName: string;
-  qualityScore: number;
-  response: string;
-  passedThreshold: boolean;
-};
+  name: string;
+  prompt: string;
+  threshold: number;
+  method: string;
+}
 
-type TrendDataPoint = {
-  date: string;
-  [modelName: string]: number | string;
+interface ModelInfo {
+  id: string;
+  label: string;
+  family: string;
+}
+
+interface ProviderInfo {
+  id: string;
+  name: string;
+  configured: boolean;
+}
+
+type SampleRun = TestRun & { isSample: true };
+
+/**
+ * A single, clearly labelled fixture so the UI is explorable before any API
+ * call is made. It is badged as a sample everywhere it appears and is excluded
+ * from every average and chart.
+ */
+const SAMPLE_RUN: SampleRun = {
+  isSample: true,
+  id: "sample_instruction_following",
+  timestamp: "2026-01-01T00:00:00.000Z",
+  categoryId: "instruction_following",
+  categoryName: "Instruction Following",
+  model: "sample — gpt-4o-mini",
+  provider: "entelic",
+  prompt:
+    "List exactly 3 benefits of exercise. Format as: 1. [benefit] 2. [benefit] 3. [benefit]. Do not add introduction or conclusion.",
+  response:
+    "1. Improved cardiovascular health\n2. Better mood and mental wellbeing\n3. Stronger muscles and bones",
+  score: 100,
+  passedThreshold: true,
+  threshold: 85,
+  checks: [
+    {
+      name: "Exactly three items",
+      passed: true,
+      detail:
+        "Found 3 item(s) with sequential numbering: 1. Improved cardiovascular health | 2. Better mood and mental wellbeing | 3. Stronger muscles and bones (items may be on one line; found by numbering, not line breaks)",
+    },
+    {
+      name: "Numbered 1, 2, 3 in order",
+      passed: true,
+      detail: "Sequential markers found: 1, 2, 3",
+    },
+    {
+      name: "No preamble before item 1",
+      passed: true,
+      detail: "Response opens directly with item 1.",
+    },
+    {
+      name: "Item 3 is a short phrase, not a trailing summary",
+      passed: true,
+      detail: "Item 3 is 5 word(s) — a benefit phrase, not a paragraph.",
+    },
+    {
+      name: "No added prose lines",
+      passed: true,
+      detail: "All 3 line(s) carry numbered items.",
+    },
+  ],
+  artifacts: {
+    note: "Hand-written example, not a live provider call.",
+    parsedItems: [],
+    lineCount: 3,
+  },
+  meta: {
+    provider: "entelic",
+    modelRequested: "gpt-4o-mini",
+    modelServed: null,
+    route: null,
+    requestId: null,
+    systemFingerprint: null,
+    promptTokens: null,
+    completionTokens: null,
+    totalTokens: null,
+    chargedAmount: null,
+    latency: null,
+    wallClockMs: 0,
+  },
+  error: null,
 };
 
 export default function DashboardPage() {
-  const [testResults, setTestResults] = useState<TestResult[]>([]);
-  const [isRunningTest, setIsRunningTest] = useState(false);
-  const [selectedCategory, setSelectedCategory] = useState<keyof typeof TEST_CATEGORIES>("CODE_GENERATION");
-  const [selectedModel, setSelectedModel] = useState("gpt-4");
+  const [runs, setRuns] = useState<TestRun[]>([]);
+  const [categories, setCategories] = useState<CategoryInfo[]>([]);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [selectedCategory, setSelectedCategory] = useState<string>("");
+  const [selectedModel, setSelectedModel] = useState<string>("");
+  const [selectedProvider, setSelectedProvider] = useState<string>("entelic");
+  const [isRunning, setIsRunning] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [showSample, setShowSample] = useState(true);
 
-  // Calculate trend data for charts
-  const trendDataByModel = testResults.reduce((acc, result) => {
-    const dateKey = format(result.timestamp, "MMM dd");
-    const existing = acc.find((d) => d.date === dateKey);
-    
-    if (existing) {
-      existing[result.modelName] = result.qualityScore;
-    } else {
-      acc.push({
-        date: dateKey,
-        [result.modelName]: result.qualityScore,
-      });
-    }
-    
-    return acc;
-  }, [] as TrendDataPoint[]);
+  useEffect(() => {
+    setRuns(loadRuns());
+  }, []);
 
-  // Get unique model names from results
-  const uniqueModels = Array.from(new Set(testResults.map(r => r.modelName)));
-
-  // Mock test runner (would call real API in production)
-  const runQualityTest = async () => {
-    setIsRunningTest(true);
-    
-    // Simulate API call delay
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    // Generate mock quality score with some variance
-    const baseScore = 75;
-    const variance = Math.random() * 20 - 10;
-    const qualityScore = Math.min(100, Math.max(0, baseScore + variance));
-    
-    const category = TEST_CATEGORIES[selectedCategory];
-    const passedThreshold = qualityScore >= category.scoreThreshold;
-    
-    const newResult: TestResult = {
-      id: `test_${Date.now()}`,
-      timestamp: new Date(),
-      category: category.name,
-      modelName: selectedModel,
-      qualityScore: Math.round(qualityScore),
-      response: "Mock response from AI model...",
-      passedThreshold,
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/run-test");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (cancelled) return;
+        setCategories(data.categories ?? []);
+        setModels(data.models ?? []);
+        setProviders(data.providers ?? []);
+        if (data.categories?.[0]) setSelectedCategory(data.categories[0].id);
+        if (data.models?.[0]) setSelectedModel(data.models[0].id);
+        const firstConfigured = (data.providers ?? []).find(
+          (p: ProviderInfo) => p.configured
+        );
+        if (firstConfigured) setSelectedProvider(firstConfigured.id);
+      } catch (err) {
+        if (!cancelled) {
+          setLoadError(
+            err instanceof Error ? err.message : "Failed to load test suite."
+          );
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
-    
-    setTestResults(prev => [newResult, ...prev]);
-    setIsRunningTest(false);
-  };
+  }, []);
 
-  // Calculate average score by model
-  const averageScoresByModel = uniqueModels.map(modelName => {
-    const modelResults = testResults.filter(r => r.modelName === modelName);
-    const avgScore = modelResults.reduce((sum, r) => sum + r.qualityScore, 0) / modelResults.length;
-    return { modelName, avgScore: Math.round(avgScore) };
-  });
+  const currentCategory = categories.find((c) => c.id === selectedCategory);
+
+  const runQualityTest = useCallback(async () => {
+    if (!selectedCategory || !selectedModel) return;
+    setIsRunning(true);
+    setRunError(null);
+    try {
+      const res = await fetch("/api/run-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          categoryId: selectedCategory,
+          model: selectedModel,
+          provider: selectedProvider,
+        }),
+      });
+      const data = (await res.json()) as TestRun & { error?: string };
+      if (!data.id) {
+        throw new Error(data.error ?? `HTTP ${res.status}`);
+      }
+      setRuns((prev) => [data, ...prev]);
+      saveRun(data);
+    } catch (err) {
+      setRunError(err instanceof Error ? err.message : "Request failed.");
+    } finally {
+      setIsRunning(false);
+    }
+  }, [selectedCategory, selectedModel, selectedProvider]);
+
+  // Real runs drive every statistic. The sample is displayed separately.
+  const visibleRuns = useMemo(
+    () => (showSample ? [...runs, SAMPLE_RUN] : runs),
+    [runs, showSample]
+  );
+
+  const trendData = useMemo(() => {
+    const byDate = new Map<string, Record<string, number | string>>();
+    for (const r of [...runs].reverse()) {
+      const key = format(new Date(r.timestamp), "MM/dd HH:mm");
+      const row = byDate.get(key) ?? { date: key };
+      row[r.model] = r.score;
+      byDate.set(key, row);
+    }
+    return [...byDate.values()];
+  }, [runs]);
+
+  const averages = useMemo(() => {
+    const byModel = new Map<string, number[]>();
+    for (const r of runs) {
+      byModel.set(r.model, [...(byModel.get(r.model) ?? []), r.score]);
+    }
+    return [...byModel.entries()].map(([model, scores]) => ({
+      model,
+      avg: Math.round(scores.reduce((a, b) => a + b, 0) / scores.length),
+      n: scores.length,
+    }));
+  }, [runs]);
+
+  const uniqueModels = useMemo(
+    () => [...new Set(runs.map((r) => r.model))],
+    [runs]
+  );
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
       <header className="border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="container mx-auto px-4 py-6">
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-3xl font-bold tracking-tight">AI Quality Monitor</h1>
+              <h1 className="text-3xl font-bold tracking-tight">
+                AI Quality Monitor
+              </h1>
               <p className="mt-1 text-sm text-muted-foreground">
                 Track model performance degradation over time
               </p>
             </div>
-            <a
-              href="/about"
-              className="text-sm text-primary hover:underline"
-            >
+            <Link href="/about" className="text-sm text-primary hover:underline">
               About this tool
-            </a>
+            </Link>
           </div>
         </div>
       </header>
 
       <main className="container mx-auto px-4 py-8">
-        {/* Test Runner Section */}
+        {loadError && (
+          <div className="mb-8 rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm">
+            <strong>Could not load the test suite.</strong> {loadError}
+          </div>
+        )}
+
+        {/* Test runner */}
         <section className="mb-12">
           <div className="rounded-lg border border-border bg-muted/40 p-6">
             <h2 className="mb-4 text-xl font-semibold">Run Quality Test</h2>
-            
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <div>
-                <label htmlFor="model-select" className="mb-2 block text-sm font-medium">
+                <label
+                  htmlFor="model-select"
+                  className="mb-2 block text-sm font-medium"
+                >
                   Model
                 </label>
                 <select
                   id="model-select"
                   value={selectedModel}
                   onChange={(e) => setSelectedModel(e.target.value)}
-                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring"
+                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                 >
-                  <option value="gpt-4">GPT-4</option>
-                  <option value="gpt-3.5-turbo">GPT-3.5 Turbo</option>
-                  <option value="claude-3-opus">Claude 3 Opus</option>
-                  <option value="claude-3-sonnet">Claude 3 Sonnet</option>
+                  {models.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label} — {m.family}
+                    </option>
+                  ))}
                 </select>
               </div>
 
               <div>
-                <label htmlFor="category-select" className="mb-2 block text-sm font-medium">
+                <label
+                  htmlFor="category-select"
+                  className="mb-2 block text-sm font-medium"
+                >
                   Test Category
                 </label>
                 <select
                   id="category-select"
                   value={selectedCategory}
-                  onChange={(e) => setSelectedCategory(e.target.value as keyof typeof TEST_CATEGORIES)}
-                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring"
+                  onChange={(e) => setSelectedCategory(e.target.value)}
+                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                 >
-                  {Object.entries(TEST_CATEGORIES).map(([key, cat]) => (
-                    <option key={key} value={key}>
-                      {cat.name}
+                  {categories.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="provider-select"
+                  className="mb-2 block text-sm font-medium"
+                >
+                  Provider
+                </label>
+                <select
+                  id="provider-select"
+                  value={selectedProvider}
+                  onChange={(e) => setSelectedProvider(e.target.value)}
+                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                >
+                  {providers.map((p) => (
+                    <option key={p.id} value={p.id} disabled={!p.configured}>
+                      {p.name}
+                      {p.configured ? "" : " — no key set"}
                     </option>
                   ))}
                 </select>
@@ -172,72 +318,92 @@ export default function DashboardPage() {
               <div className="flex items-end">
                 <button
                   onClick={runQualityTest}
-                  disabled={isRunningTest}
-                  className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={isRunning || !selectedCategory || !selectedModel}
+                  className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {isRunningTest ? "Running test..." : "Run Test"}
+                  {isRunning ? "Running test..." : "Run Test"}
                 </button>
               </div>
             </div>
 
-            <div className="mt-4 rounded-md bg-muted p-3">
-              <p className="text-sm text-muted-foreground">
-                <span className="font-medium">Test prompt:</span>{" "}
-                {TEST_CATEGORIES[selectedCategory].prompt}
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Pass threshold: {TEST_CATEGORIES[selectedCategory].scoreThreshold}%
-              </p>
-            </div>
+            {currentCategory && (
+              <div className="mt-4 rounded-md bg-muted p-3">
+                <p className="text-sm text-muted-foreground">
+                  <span className="font-medium">Test prompt:</span>{" "}
+                  {currentCategory.prompt}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Pass threshold: {currentCategory.threshold}%
+                </p>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  <span className="font-medium">Scored by:</span>{" "}
+                  {currentCategory.method}
+                </p>
+              </div>
+            )}
+
+            {runError && (
+              <div className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm">
+                {runError}
+              </div>
+            )}
           </div>
         </section>
 
-        {/* Results Section */}
-        {testResults.length === 0 ? (
+        {/* Results */}
+        {visibleRuns.length === 0 ? (
           <div className="rounded-lg border border-dashed border-border p-12 text-center">
-            <svg
-              className="mx-auto h-12 w-12 text-muted-foreground"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              aria-hidden="true"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={1.5}
-                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-              />
-            </svg>
-            <h3 className="mt-4 text-lg font-medium">No tests run yet</h3>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Run your first quality check to start tracking model performance over time.
+            <h3 className="text-lg font-medium">No tests run yet</h3>
+            <p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">
+              Run a quality check to call the provider and store a real,
+              clickable result. Every score comes from deterministic checks you
+              can inspect.
             </p>
           </div>
         ) : (
           <>
-            {/* Model Comparison Cards */}
-            {averageScoresByModel.length > 0 && (
+            {runs.length > 0 && averages.length > 0 && (
               <section className="mb-8">
-                <h2 className="mb-4 text-xl font-semibold">Average Quality by Model</h2>
+                <div className="mb-4 flex items-center justify-between">
+                  <h2 className="text-xl font-semibold">
+                    Average Quality by Model
+                  </h2>
+                  <button
+                    onClick={() => {
+                      clearRuns();
+                      setRuns([]);
+                    }}
+                    className="text-xs text-muted-foreground hover:text-destructive"
+                  >
+                    Clear history
+                  </button>
+                </div>
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                  {averageScoresByModel.map(({ modelName, avgScore }) => (
-                    <div key={modelName} className="rounded-lg border border-border bg-background p-4">
-                      <p className="text-sm font-medium text-muted-foreground">{modelName}</p>
+                  {averages.map(({ model, avg, n }) => (
+                    <div
+                      key={model}
+                      className="rounded-lg border border-border bg-background p-4"
+                    >
+                      <p className="text-sm font-medium text-muted-foreground">
+                        {model}
+                      </p>
                       <p className="mt-2 text-3xl font-bold">
-                        {avgScore}
+                        {avg}
                         <span className="text-lg text-muted-foreground">%</span>
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {n} run{n === 1 ? "" : "s"}
                       </p>
                       <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
                         <div
                           className={`h-full ${
-                            avgScore >= 80
-                              ? "bg-success"
-                              : avgScore >= 60
-                              ? "bg-warning"
-                              : "bg-destructive"
+                            avg >= 80
+                              ? "bg-[hsl(var(--success))]"
+                              : avg >= 60
+                              ? "bg-[hsl(var(--warning))]"
+                              : "bg-[hsl(var(--destructive))]"
                           }`}
-                          style={{ width: `${avgScore}%` }}
+                          style={{ width: `${avg}%` }}
                         />
                       </div>
                     </div>
@@ -246,14 +412,18 @@ export default function DashboardPage() {
               </section>
             )}
 
-            {/* Trend Chart */}
-            {trendDataByModel.length > 1 && (
+            {trendData.length > 1 && (
               <section className="mb-8">
-                <h2 className="mb-4 text-xl font-semibold">Quality Trends Over Time</h2>
+                <h2 className="mb-4 text-xl font-semibold">
+                  Quality Trends Over Time
+                </h2>
                 <div className="rounded-lg border border-border bg-background p-6">
                   <ResponsiveContainer width="100%" height={300}>
-                    <LineChart data={trendDataByModel}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                    <LineChart data={trendData}>
+                      <CartesianGrid
+                        strokeDasharray="3 3"
+                        stroke="hsl(var(--border))"
+                      />
                       <XAxis
                         dataKey="date"
                         stroke="hsl(var(--muted-foreground))"
@@ -272,11 +442,11 @@ export default function DashboardPage() {
                         }}
                       />
                       <Legend />
-                      {uniqueModels.map((modelName, idx) => (
+                      {uniqueModels.map((model, idx) => (
                         <Line
-                          key={modelName}
+                          key={model}
                           type="monotone"
-                          dataKey={modelName}
+                          dataKey={model}
                           stroke={`hsl(${(idx * 360) / uniqueModels.length}, 70%, 50%)`}
                           strokeWidth={2}
                           dot={{ r: 4 }}
@@ -288,64 +458,106 @@ export default function DashboardPage() {
               </section>
             )}
 
-            {/* Recent Test Results */}
             <section>
-              <h2 className="mb-4 text-xl font-semibold">Recent Test Results</h2>
-              <div className="space-y-3">
-                {testResults.slice(0, 10).map((result) => (
-                  <div
-                    key={result.id}
-                    className="rounded-lg border border-border bg-background p-4 transition-colors hover:bg-muted/40"
+              <div className="mb-2 flex items-center justify-between">
+                <h2 className="text-xl font-semibold">Recent Test Results</h2>
+                {runs.length > 0 && (
+                  <button
+                    onClick={() => setShowSample((s) => !s)}
+                    className="text-xs text-muted-foreground hover:text-primary"
                   >
-                    <div className="flex items-start justify-between">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-3">
-                          <span className="text-sm font-medium">{result.modelName}</span>
-                          <span className="text-xs text-muted-foreground">•</span>
-                          <span className="text-sm text-muted-foreground">{result.category}</span>
-                          <span className="text-xs text-muted-foreground">•</span>
-                          <span className="text-xs text-muted-foreground">
-                            {format(result.timestamp, "MMM dd, HH:mm")}
+                    {showSample ? "Hide" : "Show"} sample
+                  </button>
+                )}
+              </div>
+              <p className="mb-4 text-sm text-muted-foreground">
+                Select a result to see the full prompt, response, and the checks
+                behind the score.
+              </p>
+              <div className="space-y-3">
+                {visibleRuns.slice(0, 20).map((result) => {
+                  const isSample = (result as SampleRun).isSample === true;
+                  return (
+                    <Link
+                      key={result.id}
+                      href={isSample ? "#" : `/results/${result.id}`}
+                      aria-disabled={isSample}
+                      onClick={(e) => {
+                        if (isSample) e.preventDefault();
+                      }}
+                      className={`block rounded-lg border bg-background p-4 transition-colors ${
+                        isSample
+                          ? "cursor-default border-dashed opacity-70"
+                          : "border-border hover:border-primary hover:bg-muted/40"
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-sm font-medium">
+                              {result.model}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              •
+                            </span>
+                            <span className="text-sm text-muted-foreground">
+                              {result.categoryName}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              •
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              {isSample
+                                ? "example"
+                                : format(
+                                    new Date(result.timestamp),
+                                    "MMM dd, HH:mm"
+                                  )}
+                            </span>
+                            {isSample && (
+                              <span className="rounded-full bg-[hsl(var(--warning))]/20 px-2 py-0.5 text-[10px] font-medium text-[hsl(var(--warning))]">
+                                SAMPLE — NOT A LIVE CALL
+                              </span>
+                            )}
+                            {result.error && (
+                              <span className="rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
+                                ERROR
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-2 flex flex-wrap items-center gap-3">
+                            <span className="text-2xl font-bold">
+                              {result.score}%
+                            </span>
+                            {result.passedThreshold ? (
+                              <span className="rounded-full bg-[hsl(var(--success))]/10 px-2 py-1 text-xs font-medium text-[hsl(var(--success))]">
+                                Passed
+                              </span>
+                            ) : (
+                              <span className="rounded-full bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive">
+                                Below threshold
+                              </span>
+                            )}
+                            <span className="text-xs text-muted-foreground">
+                              {result.checks.filter((c) => c.passed).length}/
+                              {result.checks.length} checks passed
+                            </span>
+                          </div>
+                          <p className="mt-2 line-clamp-2 text-xs text-muted-foreground">
+                            {result.response
+                              ? result.response.slice(0, 160)
+                              : result.error}
+                          </p>
+                        </div>
+                        {!isSample && (
+                          <span className="whitespace-nowrap text-xs text-primary">
+                            View report →
                           </span>
-                        </div>
-                        <div className="mt-2 flex items-center gap-2">
-                          <span className="text-2xl font-bold">{result.qualityScore}%</span>
-                          {result.passedThreshold ? (
-                            <span className="inline-flex items-center rounded-full bg-success/10 px-2 py-1 text-xs font-medium text-success">
-                              Passed
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center rounded-full bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive">
-                              Below threshold
-                            </span>
-                          )}
-                        </div>
+                        )}
                       </div>
-                      <div className="ml-4">
-                        <div className="h-16 w-16 rounded-full border-4 border-muted flex items-center justify-center relative">
-                          <svg className="h-16 w-16 -rotate-90">
-                            <circle
-                              cx="32"
-                              cy="32"
-                              r="28"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="4"
-                              className={
-                                result.qualityScore >= 80
-                                  ? "text-success"
-                                  : result.qualityScore >= 60
-                                  ? "text-warning"
-                                  : "text-destructive"
-                              }
-                              strokeDasharray={`${(result.qualityScore / 100) * 176} 176`}
-                            />
-                          </svg>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                ))}
+                    </Link>
+                  );
+                })}
               </div>
             </section>
           </>
@@ -354,7 +566,8 @@ export default function DashboardPage() {
 
       <footer className="mt-16 border-t border-border bg-muted/40 py-8">
         <div className="container mx-auto px-4 text-center text-sm text-muted-foreground">
-          Built to address the #1 AI pain point: quality degradation over time
+          Scores are produced by deterministic checks against fixed answer keys
+          — every number is reproducible and inspectable.
         </div>
       </footer>
     </div>
